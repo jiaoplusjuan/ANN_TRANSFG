@@ -10,10 +10,10 @@ import time
 
 from datetime import timedelta
 from tqdm import tqdm
-
 import jittor as jt
 jt.flags.use_cuda = jt.has_cuda
 from jittor.nn import CrossEntropyLoss, FocalLoss
+
 
 from models.modeling import VisionTransformer, CONFIGS, LabelSmoothing, con_loss_mix
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
@@ -21,7 +21,7 @@ from utils.vis_utils import *
 from utils.data_utils import get_loader
 
 logger = logging.getLogger(__name__)
-
+logging.getLogger("PIL.TiffImagePlugin").setLevel(logging.WARNING)
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -41,7 +41,9 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 def simple_accuracy(preds, labels):
+    print((preds==labels).shape)
     return (preds == labels).mean()
+
 
 def reduce_mean(tensor):
     return tensor.mean()
@@ -49,7 +51,7 @@ def reduce_mean(tensor):
 def save_model(args, model):
     model_to_save = model.module if hasattr(model, 'module') else model
     model_checkpoint = os.path.join(args.output_dir, "%s_checkpoint.bin" % args.name)
-    
+
     checkpoint = {
         'model': model_to_save.state_dict(),
     }
@@ -98,7 +100,6 @@ def set_seed(args):
     np.random.seed(args.seed)
     jt.set_global_seed(args.seed)
     jt.seed(args.seed)
-
 
 def valid(args, model, test_loader, global_step):
     # Validation!
@@ -152,7 +153,7 @@ def valid(args, model, test_loader, global_step):
     logger.info("Global Steps: %d" % global_step)
     logger.info("Valid Loss: %2.5f" % eval_losses.avg)
     logger.info("Valid Accuracy: %2.5f" % val_accuracy)
-
+    
     return eval_losses.avg, val_accuracy
 
 def fmix_data(x, y, alpha=1.0, decay_power=3, max_soft=0.0, reformulate=False):
@@ -196,14 +197,17 @@ def mixup_data(x, y, args, alpha=1.0):
         batch_size = x.size(0)
         index = jt.randperm(batch_size)
 
+        # 生成裁剪区域的边界坐标
         H, W = x.size(2), x.size(3)
         cut_rat = np.sqrt(1. - lam)
         cut_w = np.int32(W * cut_rat)
         cut_h = np.int32(H * cut_rat)
 
+        # 确保裁剪区域至少为1x1
         cut_w = max(1, cut_w)
         cut_h = max(1, cut_h)
 
+        # 随机生成裁剪区域的中心点
         cx = np.random.randint(W)
         cy = np.random.randint(H)
 
@@ -245,8 +249,6 @@ def mixup_data(x, y, args, alpha=1.0):
     else:
         if alpha > 0:
             lam = np.random.beta(alpha, alpha)
-            if lam < 0.5:
-                lam = 1 - lam
         else:
             lam = 1
         batch_size = x.size()[0]
@@ -273,16 +275,13 @@ def mixup_data(x, y, args, alpha=1.0):
             if image.shape[-1] not in [1, 3]:
                 raise ValueError("Image has an unexpected number of channels.")
             
-            # Create an Image object and save it
-            img = Image.fromarray(image)
-            img.save(os.path.join(f'image/image_{i}.jpg'))
         return mixed_x, y_a, y_b, lam
 
 def train(args, model):
     """ Train the model """
     if args.local_rank in [-1, 0]:
         os.makedirs(args.output_dir, exist_ok=True)
-
+        
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
     # Prepare dataset
@@ -293,7 +292,7 @@ def train(args, model):
                                 lr=args.learning_rate,
                                 momentum=0.9,
                                 weight_decay=args.weight_decay)
-    # optimizer.zero_grad()
+    
     t_total = args.num_steps
     if args.decay_type == "cosine":
         scheduler = WarmupCosineSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
@@ -335,20 +334,14 @@ def train(args, model):
             if args.mix != "none":
                 # 应用 Mixup
                 inputs, targets_a, targets_b, lam = mixup_data(x, y, args, alpha=args.mix_alpha)
-
                 loss, logits = model(inputs, targets_a, targets_b, lam)
-
                 loss = loss.mean()
-
             else:
                 loss, logits = model(x, y)
                 loss = loss.mean()
 
-
             tmp_losses.append(loss)
-
             preds, _ = jt.argmax(logits, dim=-1)
-
             if len(all_preds) == 0:
                 all_preds.append(preds.numpy())
                 all_label.append(y.numpy())
@@ -427,12 +420,12 @@ def main():
                         help="Name of this run. Used for monitoring.", default="debug")
     parser.add_argument("--dataset", choices=["CUB_200_2011", "car", "dog", "nabirds", "INat2017"], default="CUB_200_2011",
                         help="Which dataset.")
-    parser.add_argument('--data_root', type=str, default='/home/aiuser/workspace/2024ANN/dataset')
+    parser.add_argument('--data_root', type=str, default='/workspace/hezehai/ANN')
     parser.add_argument("--model_type", choices=["ViT-B_16", "ViT-B_32", "ViT-L_16",
                                                  "ViT-L_32", "ViT-H_14"],
                         default="ViT-B_16",
                         help="Which variant to use.")
-    parser.add_argument("--pretrained_dir", type=str, default="/home/aiuser/workspace/2024ANN/model/ViT-B_16.npz",
+    parser.add_argument("--pretrained_dir", type=str, default="/workspace/hezehai/model/imagenet/ViT-B_16.npz",
                         help="Where to search for pretrained ViT models.")
     parser.add_argument("--pretrained_model", type=str, default=None,
                         help="load pretrained model")
@@ -442,9 +435,9 @@ def main():
                         help="Resolution size")
     parser.add_argument("--train_batch_size", default=8, type=int,
                         help="Total batch size for training.")
-    parser.add_argument("--eval_batch_size", default=8, type=int,
+    parser.add_argument("--eval_batch_size", default=32, type=int,
                         help="Total batch size for eval.")
-    parser.add_argument("--eval_every", default=500, type=int,
+    parser.add_argument("--eval_every", default=100, type=int,
                         help="Run prediction on validation set every so many steps."
                              "Will always run one evaluation at the end of training.")
 
@@ -476,8 +469,8 @@ def main():
                         help="Label smoothing value\n")
     
     parser.add_argument('--clip_alpha', type=float , default=0.4)
-    parser.add_argument('--psm', type=str, default='use')
-    parser.add_argument('--con_loss', type=str, default="use")
+    parser.add_argument('--psm', type=int, default=1)
+    parser.add_argument('--con_loss', type=int, default=1)
     parser.add_argument('--split', type=str, default='non-overlap',
                         help="Split method")
     parser.add_argument('--slide_step', type=int, default=12,
@@ -501,7 +494,7 @@ def main():
         filename=args.name+'.log',  # 指定日志文件名
         filemode='w'  # 写入模式，'w' 表示覆盖写入，'a' 表示追加写入
     )
-
+    
     args.data_root = '{}/{}'.format(args.data_root, args.dataset)
     # Setup CUDA, GPU
     args.n_gpu = jt.get_device_count()

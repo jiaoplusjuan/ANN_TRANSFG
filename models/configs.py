@@ -28,6 +28,9 @@ def get_b16_config():
     config.transformer.num_layers = 12
     config.transformer.attention_dropout_rate = 0.0
     config.transformer.dropout_rate = 0.1
+    config.psm_layer = [1,2,3,4,5,6,7,8,9,10,11]
+    config.psm_policy = "matmul" # "dot" / "ffvt" 
+    config.select_policy = "discrete" # "continuous" / "discrete"
     config.classifier = 'token'
     config.representation_size = None
     return config

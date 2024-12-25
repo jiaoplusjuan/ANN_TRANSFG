@@ -76,6 +76,7 @@ class LabelSmoothing(nn.Module):
 class Attention(nn.Module):
     def __init__(self, config):
         super(Attention, self).__init__()
+        self.config = config
         self.num_attention_heads = config.transformer["num_heads"]
         self.attention_head_size = int(config.hidden_size / self.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
@@ -116,8 +117,63 @@ class Attention(nn.Module):
         context_layer = jt.reshape(context_layer, new_context_layer_shape)
         attention_output = self.out(context_layer)
         attention_output = self.proj_dropout(attention_output)
-        return attention_output, weights
+        
+        if self.config.psm_policy == "ffvt":
+            attention_probs_col = self.softmax(jt.transpose(attention_scores, -1, -2)).transpose(-1, -2)
+            last_map = attention_probs_col * attention_probs
+            last_map = last_map[:,:,0,1:]
+            max_inx, _ = jt.argmax(last_map, dim=2)
+            return attention_output, attention_scores, max_inx
+        return attention_output, attention_scores
+class MlpConv(nn.Module):
+    def __init__(self, config):
+        super(MlpConv, self).__init__()
+        self.hidden_size = config.hidden_size
+        self.mlp_dim = config.transformer["mlp_dim"]
+        self.h = 28
+        self.w = 28
 
+        self.fc1 = nn.Conv2d(self.hidden_size, self.mlp_dim, kernel_size=1)
+        self.depthwise_conv = nn.Conv2d(self.mlp_dim, self.mlp_dim, kernel_size=3, padding=1, groups=self.mlp_dim)
+        self.fc2 = nn.Conv2d(self.mlp_dim, self.hidden_size, kernel_size=1)
+        self.act_fn = nn.GELU()
+        self.dropout = nn.Dropout(config.transformer["dropout_rate"])
+
+        self._init_weights()
+
+    def _init_weights(self):
+        jt.init.xavier_uniform_(self.fc1.weight)
+        jt.init.xavier_uniform_(self.fc2.weight)
+        jt.init.xavier_uniform_(self.depthwise_conv.weight)
+        jt.init.gauss_(self.fc1.bias, std=1e-6)
+        jt.init.gauss_(self.fc2.bias, std=1e-6)
+
+    def execute(self, x):
+        batch_size, seq_len, dim = x.shape
+        h, w = self.h, self.w
+        # assert (seq_len - 1) == h * w
+        # 拆分类标记和图像标记
+        cls_token, img_tokens = x[:, 0], x[:, 1:]
+        img_tokens = img_tokens.view(batch_size, h, w, dim)
+
+        img_tokens = img_tokens.permute(0, 3, 1, 2)  # (batch_size, dim, h, w)
+        # 拆分类标记和图像标记
+        cls_token, img_tokens = x[:, 0], x[:, 1:]
+        img_tokens = img_tokens.permute(0, 2, 1).view(batch_size, dim, h, w)  # (batch_size, dim, h, w)
+
+        img_tokens = self.fc1(img_tokens)
+        img_tokens = self.depthwise_conv(img_tokens)
+        img_tokens = self.act_fn(img_tokens)
+        img_tokens = self.dropout(img_tokens)
+        img_tokens = self.fc2(img_tokens)
+        img_tokens = self.dropout(img_tokens)
+
+        img_tokens = img_tokens.permute(0, 2, 3, 1).view(batch_size, seq_len - 1, dim)  # (batch_size, seq_len-1, dim)
+
+        # 合并类标记和处理后的图像标记
+        x = jt.concat([cls_token.unsqueeze(1), img_tokens], dim=1)  # (batch_size, seq_len, dim)
+        return x
+    
 class Mlp(nn.Module):
     def __init__(self, config):
         super(Mlp, self).__init__()
@@ -141,53 +197,6 @@ class Mlp(nn.Module):
         x = self.fc2(x)
         x = self.dropout(x)
         return x
-
-class MlpConv(nn.Module):
-    def __init__(self, config):
-        super(Mlp, self).__init__()
-        self.hidden_size = config.hidden_size
-        self.mlp_dim = config.transformer["mlp_dim"]
-        self.h = 28
-        self.w = 28
-
-        self.fc1 = nn.Conv2d(self.hidden_size, self.mlp_dim, kernel_size=1)
-        self.depthwise_conv = nn.Conv2d(self.mlp_dim, self.mlp_dim, kernel_size=3, padding=1)
-        self.fc2 = nn.Conv2d(self.mlp_dim, self.hidden_size, kernel_size=1)
-        self.act_fn = nn.GELU()
-        self.dropout = nn.Dropout(config.transformer["dropout_rate"])
-
-        self._init_weights()
-
-    def _init_weights(self):
-        jt.init.xavier_uniform_(self.fc1.weight)
-        jt.init.xavier_uniform_(self.fc2.weight)
-        jt.init.xavier_uniform_(self.depthwise_conv.weight)
-        jt.init.gauss_(self.fc1.bias, std=1e-6)
-        jt.init.gauss_(self.fc2.bias, std=1e-6)
-
-    def execute(self, x):
-        batch_size, seq_len, dim = x.shape
-        h, w = self.h, self.w
-        # 拆分类标记和图像标记
-        cls_token, img_tokens = x[:, 0], x[:, 1:]
-
-        img_tokens = img_tokens.view(batch_size, h, w, dim)
-
-        img_tokens = img_tokens.permute(0, 3, 1, 2)  # (batch_size, dim, h, w)
-
-        img_tokens = self.fc1(img_tokens)
-        img_tokens = self.depthwise_conv(img_tokens)
-        img_tokens = self.act_fn(img_tokens)
-        img_tokens = self.dropout(img_tokens)
-        img_tokens = self.fc2(img_tokens)
-        img_tokens = self.dropout(img_tokens)
-
-        img_tokens = img_tokens.permute(0, 2, 3, 1).view(batch_size, seq_len - 1, dim)  # (batch_size, seq_len-1, dim)
-
-        # 合并类标记和处理后的图像标记
-        x = jt.concat([cls_token.unsqueeze(1), img_tokens], dim=1)  # (batch_size, seq_len, dim)
-        return x
-    
 
 class Embeddings(nn.Module):
     """Construct the embeddings from patch, position embeddings.
@@ -241,18 +250,25 @@ class Block(nn.Module):
         else:
             self.ffn = Mlp(config)
         self.attn = Attention(config)
+        self.config = config
 
     def execute(self, x):
         h = x
         x = self.attention_norm(x)
-        x, weights = self.attn(x)
+        if self.config.psm_policy == "ffvt":
+            x, scores, max_inx = self.attn(x)
+        else:
+            x, scores = self.attn(x)
         x = x + h
 
         h = x
         x = self.ffn_norm(x)
         x = self.ffn(x)
         x = x + h
-        return x, weights
+        if self.config.psm_policy == "ffvt":
+            return x, scores, max_inx
+        else:
+            return x, scores
 
     def load_from(self, weights, n_block):
         ROOT = f"Transformer/encoderblock_{n_block}"
@@ -275,6 +291,7 @@ class Block(nn.Module):
             self.attn.key.bias = jt.copy(key_bias)
             self.attn.value.bias = jt.copy(value_bias)
             self.attn.out.bias = jt.copy(out_bias)
+
             if self.conv != "use":
                 mlp_weight_0 = np2th(weights[pjoin(ROOT, FC_0, "kernel")]).transpose()
                 mlp_weight_1 = np2th(weights[pjoin(ROOT, FC_1, "kernel")]).transpose()
@@ -292,57 +309,99 @@ class Block(nn.Module):
             self.ffn_norm.bias = jt.copy(np2th(weights[pjoin(ROOT, MLP_NORM, "bias")]))
 
 class Part_Attention(nn.Module):
-    def __init__(self):
+    def __init__(self, config):
         super(Part_Attention, self).__init__()
-
+        self.config = config
+        self.softmax = Softmax(dim=-1)
     def execute(self, x):
+        attention_probs_row = [self.softmax(x_) for x_ in x]
+        attention_probs_col = [self.softmax(x_.transpose(-1,-2)).transpose(-1,-2) for x_ in x]
         length = len(x)
-        last_map = x[0]
-        for i in range(1, length):
-            last_map = jt.matmul(x[i], last_map)
+        if self.config.psm_policy == "matmul":
+            last_map = jt.init.eye(x[0].shape[-2:]).broadcast(x[0].shape)
+            for i in range(0, length):
+                if i in self.config.psm_layer:
+                    last_map = jt.matmul(attention_probs_row[i], last_map)
+        elif self.config.psm_policy == "dot":
+            last_map = jt.ones_like(x[0])
+            for i in range(0, length):
+                if i in self.config.psm_layer:
+                    last_map = attention_probs_row[i] * last_map
+        elif self.config.psm_policy == "ffvt":
+            last_map = jt.ones_like(x[0])
+            for i in range(0, length):
+                if i in self.config.psm_layer:
+                    last_map = attention_probs_col[i] * attention_probs_row[i] * last_map
+                
         last_map = last_map[:,:,0,1:]
         
         max_inx, _ = jt.argmax(last_map, dim=2)  # 最大值的索引
-        return _, max_inx
+        map_weight = jt.ones((last_map.shape[0], last_map.shape[2]))
+        for i in range(0, last_map.shape[1]):
+            map_weight = map_weight * last_map[:, i, :]
+        map_weight = (map_weight - jt.mean(map_weight, dim=-1, keepdims=True)) / jt.norm(map_weight, dim=-1, keepdims=True)
+        return map_weight, max_inx
 
 class Encoder(nn.Module):
     def __init__(self, config, psm=True):
         super(Encoder, self).__init__()
         self.layer = nn.ModuleList()
         for _ in range(config.transformer["num_layers"] - 1):
-            layer = Block(config)
+            layer = Block(config, conv="no")
             self.layer.append(copy.deepcopy(layer))
-        self.part_select = Part_Attention()
-        self.part_layer = Block(config, conv="no_use")
+        self.part_select = Part_Attention(config)
+        self.part_layer = Block(config, conv="no")
         self.part_norm = LayerNorm(config.hidden_size, eps=1e-6)
         self.psm = psm
+        self.config = config
 
     def execute(self, hidden_states):
-        attn_weights = []
+        attn_scores = []
         if self.psm:
-            for layer in self.layer:
-                hidden_states, weights = layer(hidden_states)
-                attn_weights.append(weights)        
-            part_num, part_inx = self.part_select(attn_weights)
-            part_inx = part_inx + 1
-            parts = []
-            B, num = part_inx.shape
-            for i in range(B):
-                parts.append(hidden_states[i, part_inx[i,:]])
-            parts = jt.stack(parts)
-            concat = jt.concat((hidden_states[:,0].unsqueeze(1), parts), dim=1)
-            part_states, part_weights = self.part_layer(concat)
-            part_encoded = self.part_norm(part_states)   
+            if self.config.psm_policy == "ffvt":
+                final_parts = None
+                for layer in self.layer:
+                    parts = []
+                    hidden_states, scores, part_inx = layer(hidden_states) 
+                    B, num = part_inx.shape
+                    for i in range(B):
+                        parts.append(hidden_states[i, part_inx[i,:]])
+                    parts = jt.stack(parts)
+                    if final_parts is None:
+                        final_parts = parts
+                    else:
+                        final_parts = jt.concat((final_parts, parts), dim=1)
+                concat = jt.concat((hidden_states[:,0].unsqueeze(1), final_parts), dim=1)
+                part_states, part_weights, max_inx = self.part_layer(concat)
+                part_encoded = self.part_norm(part_states)   
 
-            return part_encoded
+                return part_encoded 
+            else:
+                for layer in self.layer:
+                    hidden_states, scores = layer(hidden_states)
+                    attn_scores.append(scores)        
+                map_weight, part_inx = self.part_select(attn_scores)
+
+                part_inx = part_inx + 1
+                parts = []
+                if self.config.select_policy == "discrete":
+                    B, num = part_inx.shape
+                    for i in range(B):
+                        parts.append(hidden_states[i, part_inx[i,:]])
+                    parts = jt.stack(parts)
+                    concat = jt.concat((hidden_states[:,0].unsqueeze(1), parts), dim=1)
+                    part_states, part_weights = self.part_layer(concat)
+                elif self.config.select_policy == "continuous":
+                    hidden_states[:, 1:, :] = hidden_states[:, 1:, :] * map_weight.unsqueeze(2)
+                    part_states, part_weights = self.part_layer(hidden_states) 
+                part_encoded = self.part_norm(part_states)   
+
+                return part_encoded
         else:
             for layer in self.layer:
-                hidden_states, weights = layer(hidden_states) 
-            part_states, part_weights = self.part_layer(hidden_states)
-            
-            part_encoded = self.part_norm(part_states)   
+                hidden_states, scores = layer(hidden_states)  
 
-            return part_encoded
+            return hidden_states
         
 class Transformer(nn.Module):
     def __init__(self, config, img_size, psm=True):
@@ -354,6 +413,7 @@ class Transformer(nn.Module):
         embedding_output = self.embeddings(input_ids)
         part_encoded = self.encoder(embedding_output)
         return part_encoded
+
 
 class VisionTransformer(nn.Module):
     def __init__(self, config, img_size=224, num_classes=21843, smoothing_value=0, zero_head=False, loss_function="CrossEntropyLoss", mix=False, clip_alpha=0.4, psm=True, con_loss=True):
@@ -382,10 +442,9 @@ class VisionTransformer(nn.Module):
                     loss_fct = CrossEntropyLoss()
                 loss_fct = LabelSmoothing(self.smoothing_value, loss_fct)
                 loss = loss_fct(part_logits.view(-1, self.num_classes), labels_a.view(-1))
-                if self.con_loss == 'use':
+                if self.con_loss:
                     contrast_loss = con_loss(part_tokens[:, 0], labels_a.view(-1), self.clip_alpha)
                     loss += contrast_loss
-
                 
                 return loss, part_logits
             else:
@@ -403,6 +462,7 @@ class VisionTransformer(nn.Module):
                 if self.con_loss:
                     contrast_loss = con_loss_mix(part_tokens[:, 0], labels_a.view(-1), labels_b.view(-1), lam, part_logits, self.clip_alpha)
                     loss += contrast_loss
+                    
                 return loss, part_logits
             else:
                 return part_logits
@@ -447,6 +507,7 @@ class VisionTransformer(nn.Module):
                         unit.load_from(weights, n_block=uname)
 
             if self.transformer.embeddings.hybrid:
+                print(1)
                 self.transformer.embeddings.hybrid_model.root.conv.weight = jt.copy(np2th(weights["conv_root/kernel"], conv=True))
                 gn_weight = np2th(weights["gn_root/scale"]).view(-1)
                 gn_bias = np2th(weights["gn_root/bias"]).view(-1)
@@ -493,6 +554,7 @@ def con_loss_mix(features, labels_a, labels_b, lam, part_logits, clip_alpha):
     loss2 /= (B * B)
     return lam * loss + (1 - lam) * loss2
 
+
 CONFIGS = {
     'ViT-B_16': configs.get_b16_config(),
     'ViT-B_32': configs.get_b32_config(),
@@ -501,4 +563,3 @@ CONFIGS = {
     'ViT-H_14': configs.get_h14_config(),
     'testing': configs.get_testing(),
 }
-
